@@ -13,8 +13,9 @@ API_ID = 4880420
 API_HASH = "fe7c528c27d3993a438599063bc03a3b"
 SESSIONS = []  # Will be loaded from devour.json
 SUDO_USERS = [6836139884]
-DELAY_RANGE = (4, 6)
+DELAY_RANGE = [4, 6]  # Changed to list for easy modification
 DATA_FILE = "devour.json"
+CURRENT_FILE = "Current.json"
 PERSONAL_BOT = "im_bakabot"
 
 # ========== SHARED STATE ==========
@@ -22,9 +23,10 @@ REPLY_TEXT1 = {}
 REPLY_TEXT2 = {}
 DEVOUR_STATE = {}
 LAST_SCAN = {}
+CURRENT_EXECUTIONS = {}  # Track currently running executions
 
 def load_data():
-    global REPLY_TEXT1, REPLY_TEXT2, LAST_SCAN, SESSIONS
+    global REPLY_TEXT1, REPLY_TEXT2, LAST_SCAN, SESSIONS, DELAY_RANGE
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r") as f:
             data = json.load(f)
@@ -32,8 +34,10 @@ def load_data():
         REPLY_TEXT2 = {int(k): v for k, v in data.get("reply_text2", {}).items()}
         LAST_SCAN = {int(k): v for k, v in data.get("last_scan", {}).items()}
         SESSIONS = data.get("sessions", [])
+        DELAY_RANGE = data.get("delay_range", [4, 6])
     else:
         SESSIONS = []
+        DELAY_RANGE = [4, 6]
         save_data()
 
 def save_data():
@@ -47,13 +51,79 @@ def save_data():
             "execution_logs": [],
             "last_scan": {},
             "sessions": [],
+            "delay_range": [4, 6],
         }
     data["reply_text1"] = {str(k): v for k, v in REPLY_TEXT1.items()}
     data["reply_text2"] = {str(k): v for k, v in REPLY_TEXT2.items()}
     data["last_scan"] = {str(k): v for k, v in LAST_SCAN.items()}
     data["sessions"] = SESSIONS
+    data["delay_range"] = DELAY_RANGE
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
+
+def update_current_json(user_id, chat_id, session_name, mode, count, total):
+    """Update Current.json with execution progress"""
+    if not os.path.exists(CURRENT_FILE):
+        CURRENT_EXECUTIONS[user_id] = []
+    else:
+        try:
+            with open(CURRENT_FILE, "r") as f:
+                current_data = json.load(f)
+            CURRENT_EXECUTIONS.update(current_data)
+        except Exception:
+            CURRENT_EXECUTIONS[user_id] = []
+
+    if user_id not in CURRENT_EXECUTIONS:
+        CURRENT_EXECUTIONS[user_id] = []
+
+    # Find or create execution entry
+    exec_entry = None
+    for entry in CURRENT_EXECUTIONS[user_id]:
+        if entry["chat_id"] == chat_id and entry["session_name"] == session_name:
+            exec_entry = entry
+            break
+
+    if exec_entry is None:
+        exec_entry = {
+            "chat_id": chat_id,
+            "session_name": session_name,
+            "mode": mode,
+            "count": count,
+            "total": total,
+            "timestamp": time.time(),
+        }
+        CURRENT_EXECUTIONS[user_id].append(exec_entry)
+    else:
+        exec_entry["count"] = count
+
+    # Save to file
+    with open(CURRENT_FILE, "w") as f:
+        json.dump(CURRENT_EXECUTIONS, f, indent=2)
+
+def remove_current_json(user_id, chat_id, session_name):
+    """Remove execution from Current.json"""
+    if user_id in CURRENT_EXECUTIONS:
+        CURRENT_EXECUTIONS[user_id] = [
+            e for e in CURRENT_EXECUTIONS[user_id]
+            if not (e["chat_id"] == chat_id and e["session_name"] == session_name)
+        ]
+        if not CURRENT_EXECUTIONS[user_id]:
+            del CURRENT_EXECUTIONS[user_id]
+
+    with open(CURRENT_FILE, "w") as f:
+        json.dump(CURRENT_EXECUTIONS, f, indent=2)
+
+def load_current_json():
+    """Load Current.json"""
+    global CURRENT_EXECUTIONS
+    if os.path.exists(CURRENT_FILE):
+        try:
+            with open(CURRENT_FILE, "r") as f:
+                CURRENT_EXECUTIONS = json.load(f)
+        except Exception:
+            CURRENT_EXECUTIONS = {}
+    else:
+        CURRENT_EXECUTIONS = {}
 
 def save_execution_log(chat_id, msg_links, texts, mode):
     try:
@@ -66,6 +136,7 @@ def save_execution_log(chat_id, msg_links, texts, mode):
             "execution_logs": [],
             "last_scan": {},
             "sessions": [],
+            "delay_range": [4, 6],
         }
     log = {
         "chat_id": chat_id,
@@ -80,6 +151,7 @@ def save_execution_log(chat_id, msg_links, texts, mode):
     data["reply_text2"] = {str(k): v for k, v in REPLY_TEXT2.items()}
     data["last_scan"] = {str(k): v for k, v in LAST_SCAN.items()}
     data["sessions"] = SESSIONS
+    data["delay_range"] = DELAY_RANGE
     with open(DATA_FILE, "w") as f:
         json.dump(data, f, indent=2)
 
@@ -119,7 +191,6 @@ def parse_message_link(link):
     if len(parts) < 2:
         raise ValueError("Invalid link format")
     if parts[0] == "c":
-        # t.me/c/123456/789
         if len(parts) < 3:
             raise ValueError("Invalid /c/ link format")
         channel_id = int(parts[1])
@@ -170,13 +241,11 @@ async def run_parallel_attacks(app_list, chat_id, msg_id, text, times, cancel_ev
                 await app.send_message(chat_id, text, reply_to_message_id=msg_id)
                 await asyncio.sleep(0.25)
             except FloodWait as e:
-                # check cancel during flood waits
                 if cancel_event and cancel_event.is_set():
                     break
                 await asyncio.sleep(e.value)
             except Exception:
                 break
-    # gather tasks but allow early stop via cancel_event
     tasks = [asyncio.create_task(attack_one(a)) for a in app_list]
     try:
         await asyncio.gather(*tasks)
@@ -204,6 +273,55 @@ def register_handlers(app, all_apps=None):
         DEVOUR_STATE[user_id] = {"step": "await_target"}
         await message.reply("🔗 Send the group link (`https://t.me/...`), @username or chat id (-100...) of the target chat.")
 
+    @app.on_message(filters.command("delay") & sudo_filter & filters.private)
+    async def set_delay(client, message):
+        global DELAY_RANGE
+        parts = message.text.split()
+        if len(parts) < 3:
+            await message.reply(f"❌ **Usage:** `/delay <min> <max>`\n\nCurrent delay: `{DELAY_RANGE[0]}-{DELAY_RANGE[1]}` seconds")
+            return
+        try:
+            min_delay = int(parts[1])
+            max_delay = int(parts[2])
+            if min_delay < 0 or max_delay < 0 or min_delay > max_delay:
+                await message.reply("❌ Invalid values. Min and max must be positive, and min ≤ max.")
+                return
+            DELAY_RANGE = [min_delay, max_delay]
+            save_data()
+            await message.reply(f"✅ Delay range updated to `{min_delay}-{max_delay}` seconds.")
+        except ValueError:
+            await message.reply("❌ Invalid input. Use numbers only.")
+
+    @app.on_message(filters.command("current") & sudo_filter & filters.private)
+    async def show_current(client, message):
+        user_id = message.from_user.id
+        load_current_json()
+        
+        if user_id not in CURRENT_EXECUTIONS or not CURRENT_EXECUTIONS[user_id]:
+            await message.reply("ℹ️ No currently running executions.")
+            return
+
+        executions = CURRENT_EXECUTIONS[user_id]
+        text = "**📊 Currently Running Executions:**\n\n"
+        for idx, exec_data in enumerate(executions, 1):
+            percentage = (exec_data["count"] / exec_data["total"] * 100) if exec_data["total"] > 0 else 0
+            text += (
+                f"`{idx}` | **Target:** `{exec_data['chat_id']}`\n"
+                f"    **Session:** `{exec_data['session_name']}`\n"
+                f"    **Mode:** `{exec_data['mode']}`\n"
+                f"    **Progress:** `{exec_data['count']}/{exec_data['total']}` ({percentage:.1f}%)\n\n"
+            )
+
+        text += "Reply with the number to cancel that execution (e.g., `1` to cancel first)."
+        state = DEVOUR_STATE.get(user_id)
+        if state is None:
+            state = {"step": "select_cancel"}
+            DEVOUR_STATE[user_id] = state
+        else:
+            state["step"] = "select_cancel"
+
+        await message.reply(text)
+
     @app.on_message(
         sudo_filter
         & filters.private
@@ -220,6 +338,8 @@ def register_handlers(app, all_apps=None):
                 "delacc",
                 "delall",
                 "claim",
+                "delay",
+                "current",
             ]
         )
     )
@@ -230,23 +350,54 @@ def register_handlers(app, all_apps=None):
         state = DEVOUR_STATE[user_id]
         text = message.text.strip()
 
-        # Helper: ensure cancel_event exists for long operations
         def ensure_cancel_event():
             if "cancel_event" not in state or not isinstance(state.get("cancel_event"), asyncio.Event):
                 state["cancel_event"] = asyncio.Event()
-            # background_task may be present or None
             state.setdefault("background_task", None)
+
+        # Handle cancel selection from /current
+        if state["step"] == "select_cancel":
+            if not text.isdigit():
+                await message.reply("❌ Reply with a number.")
+                DEVOUR_STATE.pop(user_id, None)
+                return
+
+            exec_num = int(text)
+            load_current_json()
+            
+            if user_id not in CURRENT_EXECUTIONS or exec_num < 1 or exec_num > len(CURRENT_EXECUTIONS[user_id]):
+                await message.reply("❌ Invalid selection.")
+                DEVOUR_STATE.pop(user_id, None)
+                return
+
+            exec_data = CURRENT_EXECUTIONS[user_id][exec_num - 1]
+            
+            # Find the state for that execution and set cancel event
+            for uid, st in DEVOUR_STATE.items():
+                if (st.get("chat_id") == exec_data["chat_id"] and 
+                    st.get("session_name") == exec_data["session_name"]):
+                    cancel_event = st.get("cancel_event")
+                    if cancel_event:
+                        cancel_event.set()
+                    bg = st.get("background_task")
+                    if bg and isinstance(bg, asyncio.Task) and not bg.done():
+                        try:
+                            bg.cancel()
+                        except Exception:
+                            pass
+                    break
+
+            await message.reply(f"🛑 Cancellation requested for execution #{exec_num}.")
+            DEVOUR_STATE.pop(user_id, None)
+            return
 
         # STEP 1: choose target chat
         if state["step"] == "await_target":
             chat_input = text
             try:
-                # normalize username or id or full link
                 if chat_input.startswith("https://t.me/") or chat_input.startswith("http://t.me/"):
-                    # let Pyrogram resolve the URL directly
                     chat = await client.get_chat(chat_input)
                 else:
-                    # username or id
                     chat = await client.get_chat(chat_input)
                 if not chat:
                     await message.reply("❌ Could not find that chat.")
@@ -429,7 +580,6 @@ def register_handlers(app, all_apps=None):
 
             # 10) Batch range from scanned data
             if opt == "10":
-                # Ensure we have scan data (either current state or last scan)
                 user_msgs = state.get("user_msgs")
                 if not user_msgs:
                     scan = LAST_SCAN.get(chat_id)
@@ -539,14 +689,12 @@ def register_handlers(app, all_apps=None):
             if text.lower() != "yes":
                 await message.reply("❌ Type `yes` to execute.")
                 return
-            # create cancel event and optionally a background task
             ensure_cancel_event()
             state["step"] = "running_attack_links"
             chatid_or_username = state["attack_chat"]
             msg_id = state["attack_msg_id"]
             text_to_send = state["attack_text"]
             times = state["attack_times"]
-            # Resolve username to id if needed using this client
             try:
                 if isinstance(chatid_or_username, str):
                     chat_obj = await client.get_chat(chatid_or_username)
@@ -557,24 +705,25 @@ def register_handlers(app, all_apps=None):
                 await message.reply(f"❌ Failed to resolve chat: {e}")
                 DEVOUR_STATE.pop(user_id, None)
                 return
+            
             await message.reply("🚀 Spamming now from all accounts (in background)...")
-            # Launch background parallel attack if all_apps available
             if all_apps:
                 task = asyncio.create_task(
                     run_parallel_attacks(all_apps, chat_id, msg_id, text_to_send, times, cancel_event=state["cancel_event"])
                 )
                 state["background_task"] = task
-                # do not pop state here — background task will continue and user can /cancel
-                # attach done callback to cleanup
+                state["session_name"] = client.name
+                update_current_json(user_id, chat_id, client.name, "message_attack", 0, times * len(all_apps))
+
                 def _done_callback(t):
-                    # safe cleanup upon task completion
                     try:
+                        remove_current_json(user_id, chat_id, client.name)
                         DEVOUR_STATE.pop(user_id, None)
                     except Exception:
                         pass
+
                 task.add_done_callback(lambda t: _done_callback(t))
             else:
-                # If no all_apps (single client), run in this handler synchronously and check cancel_event
                 sent = 0
                 reply_text = text_to_send
                 try:
@@ -620,22 +769,27 @@ def register_handlers(app, all_apps=None):
                 await message.reply("❌ Type `yes` to confirm.")
                 return
             ensure_cancel_event()
-            await message.reply("🚀 Starting execution now...")
-            pairs = state.get("msg_pairs", [])
+            state["session_name"] = client.name
             chat_id = state["chat_id"]
-            # Use configured text for the target chat (fallback to global default)
-            reply_text = REPLY_TEXT1.get(chat_id, REPLY_TEXT1.get("default", "Hi there!"))
+            pairs = state.get("msg_pairs", [])
+            reply_text = REPLY_TEXT1.get(chat_id, REPLY_TEXT1.get("default", "/kill"))
+            
+            status_msg = await message.reply(f"🚀 Starting execution...\n✅ Progress: 0/{len(pairs)}")
+            update_current_json(user_id, chat_id, client.name, "scan_execution", 0, len(pairs))
+            
             sent = 0
             try:
-                for _, msg_id in pairs:
-                    # check for cancellation
+                for idx, (_, msg_id) in enumerate(pairs, 1):
                     if state.get("cancel_event") and state["cancel_event"].is_set():
-                        await message.reply("🛑 Execution cancelled.")
+                        await status_msg.edit(f"🛑 Execution cancelled at {sent}/{len(pairs)}.")
                         break
                     try:
                         await client.send_message(chat_id, reply_text, reply_to_message_id=msg_id)
                         sent += 1
-                        await asyncio.sleep(random.uniform(*DELAY_RANGE))
+                        update_current_json(user_id, chat_id, client.name, "scan_execution", sent, len(pairs))
+                        percentage = (sent / len(pairs)) * 100
+                        await status_msg.edit(f"✅ Progress: {sent}/{len(pairs)} ({percentage:.1f}%)")
+                        await asyncio.sleep(random.uniform(DELAY_RANGE[0], DELAY_RANGE[1]))
                     except FloodWait as e:
                         if state.get("cancel_event") and state["cancel_event"].is_set():
                             break
@@ -643,14 +797,14 @@ def register_handlers(app, all_apps=None):
                     except Exception:
                         pass
             finally:
-                # cleanup state after run (if not running background)
+                remove_current_json(user_id, chat_id, client.name)
                 DEVOUR_STATE.pop(user_id, None)
+            
             await message.reply(f"✅ Done! Message sent to {sent} users.")
             return
 
         # Batch range: await range input
         if state["step"] == "batch_await_range":
-            # Expect "start end" or single number "N"
             user_msgs = state.get("user_msgs")
             if not user_msgs:
                 await message.reply("❌ No scanned data available. Use option 1 first.")
@@ -658,7 +812,6 @@ def register_handlers(app, all_apps=None):
                 return
             total = len(user_msgs)
             raw = text.strip()
-            # Accept hyphen or space separated, or single number
             parts = None
             if "-" in raw:
                 parts = [p for p in raw.split("-") if p.strip()]
@@ -666,7 +819,6 @@ def register_handlers(app, all_apps=None):
                 parts = raw.split()
             try:
                 if len(parts) == 1:
-                    # single number -> 1..N
                     end = int(parts[0])
                     start = 1
                 elif len(parts) >= 2:
@@ -680,14 +832,29 @@ def register_handlers(app, all_apps=None):
             if start < 1 or end < start or end > total:
                 await message.reply(f"❌ Invalid range. Valid 1-based range is 1..{total}.")
                 return
-            # compute slice (1-based inclusive)
             pairs_all = list(user_msgs.items())
             selected_pairs = pairs_all[start - 1 : end]
             state["batch_range"] = (start, end)
             state["msg_pairs"] = selected_pairs
-            state["step"] = "batch_confirm"
+            state["step"] = "batch_await_text"
             await message.reply(
-                f"✅ Will send Text1 to users {start} through {end} (total {len(selected_pairs)}).\nType `yes` to confirm."
+                f"✅ Selected {len(selected_pairs)} users (range {start}-{end}).\n\n"
+                f"📝 Now send the text to send to all selected users:"
+            )
+            return
+
+        # Batch: await custom text
+        if state["step"] == "batch_await_text":
+            batch_text = text
+            if not batch_text:
+                await message.reply("❌ Text required.")
+                return
+            state["batch_text"] = batch_text
+            state["step"] = "batch_confirm"
+            pairs = state.get("msg_pairs", [])
+            await message.reply(
+                f"Ready to send `{batch_text}` to {len(pairs)} selected users.\n"
+                f"Type `yes` to confirm."
             )
             return
 
@@ -697,20 +864,27 @@ def register_handlers(app, all_apps=None):
                 await message.reply("❌ Type `yes` to confirm.")
                 return
             ensure_cancel_event()
-            await message.reply("🚀 Starting batch now...")
+            state["session_name"] = client.name
             pairs = state.get("msg_pairs", [])
             chat_id = state["chat_id"]
-            reply_text = REPLY_TEXT1.get(chat_id, REPLY_TEXT1.get("default", "Hi there!"))
+            batch_text = state.get("batch_text", "/kill")
+            
+            status_msg = await message.reply(f"🚀 Starting batch execution...\n✅ Progress: 0/{len(pairs)}")
+            update_current_json(user_id, chat_id, client.name, "batch", 0, len(pairs))
+            
             sent = 0
             try:
-                for _, msg_id in pairs:
+                for idx, (_, msg_id) in enumerate(pairs, 1):
                     if state.get("cancel_event") and state["cancel_event"].is_set():
-                        await message.reply("🛑 Batch cancelled.")
+                        await status_msg.edit(f"🛑 Batch cancelled at {sent}/{len(pairs)}.")
                         break
                     try:
-                        await client.send_message(chat_id, reply_text, reply_to_message_id=msg_id)
+                        await client.send_message(chat_id, batch_text, reply_to_message_id=msg_id)
                         sent += 1
-                        await asyncio.sleep(random.uniform(*DELAY_RANGE))
+                        update_current_json(user_id, chat_id, client.name, "batch", sent, len(pairs))
+                        percentage = (sent / len(pairs)) * 100
+                        await status_msg.edit(f"✅ Progress: {sent}/{len(pairs)} ({percentage:.1f}%)")
+                        await asyncio.sleep(random.uniform(DELAY_RANGE[0], DELAY_RANGE[1]))
                     except FloodWait as e:
                         if state.get("cancel_event") and state["cancel_event"].is_set():
                             break
@@ -718,34 +892,43 @@ def register_handlers(app, all_apps=None):
                     except Exception:
                         pass
                 try:
-                    save_execution_log(chat_id, [], [reply_text], "batch")
+                    save_execution_log(chat_id, [], [batch_text], "batch")
                 except Exception:
                     pass
             finally:
+                remove_current_json(user_id, chat_id, client.name)
                 DEVOUR_STATE.pop(user_id, None)
+            
             await message.reply(f"✅ Batch done! Message sent to {sent} users.")
             return
 
-        # Simple rob execution (re-using same executor but with rob_cmd)
+        # Simple rob execution
         if state["step"] == "rob_confirm":
             if text.lower() != "yes":
                 await message.reply("❌ Type `yes` to execute.")
                 return
             ensure_cancel_event()
-            await message.reply("🚀 Starting rob execution now...")
+            state["session_name"] = client.name
             pairs = state.get("msg_pairs", [])
             chat_id = state["chat_id"]
             rob_cmd = state["rob_cmd"]
+            
+            status_msg = await message.reply(f"🚀 Starting rob execution...\n✅ Progress: 0/{len(pairs)}")
+            update_current_json(user_id, chat_id, client.name, "rob", 0, len(pairs))
+            
             sent = 0
             try:
-                for _, msg_id in pairs:
+                for idx, (_, msg_id) in enumerate(pairs, 1):
                     if state.get("cancel_event") and state["cancel_event"].is_set():
-                        await message.reply("🛑 Rob execution cancelled.")
+                        await status_msg.edit(f"🛑 Rob execution cancelled at {sent}/{len(pairs)}.")
                         break
                     try:
                         await client.send_message(chat_id, rob_cmd, reply_to_message_id=msg_id)
                         sent += 1
-                        await asyncio.sleep(random.uniform(*DELAY_RANGE))
+                        update_current_json(user_id, chat_id, client.name, "rob", sent, len(pairs))
+                        percentage = (sent / len(pairs)) * 100
+                        await status_msg.edit(f"✅ Progress: {sent}/{len(pairs)} ({percentage:.1f}%)")
+                        await asyncio.sleep(random.uniform(DELAY_RANGE[0], DELAY_RANGE[1]))
                     except FloodWait as e:
                         if state.get("cancel_event") and state["cancel_event"].is_set():
                             break
@@ -753,7 +936,9 @@ def register_handlers(app, all_apps=None):
                     except Exception:
                         pass
             finally:
+                remove_current_json(user_id, chat_id, client.name)
                 DEVOUR_STATE.pop(user_id, None)
+            
             await message.reply(f"✅ Done! `{rob_cmd}` sent to {sent} users.")
             return
 
@@ -815,14 +1000,11 @@ def register_handlers(app, all_apps=None):
         if not state:
             await message.reply("ℹ️ No active task to cancel.")
             return
-        # set cancel event if present or create one and set it
         cancel_event = state.get("cancel_event")
         if not cancel_event:
-            # create and immediately set to ensure any running loop sees it
             cancel_event = asyncio.Event()
             state["cancel_event"] = cancel_event
         cancel_event.set()
-        # cancel background task if exists
         bg = state.get("background_task")
         if bg and isinstance(bg, asyncio.Task) and not bg.done():
             try:
@@ -830,7 +1012,6 @@ def register_handlers(app, all_apps=None):
             except Exception:
                 pass
             state["background_task"] = None
-        # mark cancelled so UI knows
         state["cancelled"] = True
         await message.reply("🛑 Cancellation requested. Stopping the current task...")
 
@@ -919,12 +1100,16 @@ def register_handlers(app, all_apps=None):
             "`/delall` - Delete all my messages from target group\n"
             "`/claim` - Call `/daily` from all accounts in @im_bakabot\n"
             "`/cancel`, `/stop` - Cancel current task\n"
+            "`/delay <min> <max>` - Set delay range (e.g. `/delay 4 6`)\n"
+            "`/current` - Show all currently running executions\n"
             "`/help` - Show this help\n\n"
-            f"**Data:** `{DATA_FILE}` | **Active accounts:** {len(SESSIONS)}"
+            f"**Data:** `{DATA_FILE}` | **Active accounts:** {len(SESSIONS)}\n"
+            f"**Current delay:** `{DELAY_RANGE[0]}-{DELAY_RANGE[1]}` seconds"
         )
 
 async def main():
     load_data()
+    load_current_json()
     if not SESSIONS:
         print("❌ No sessions found! Add sessions using /addacc in DM or edit devour.json")
         print("Creating sample devour.json structure...")
@@ -943,10 +1128,10 @@ async def main():
         apps.append(app)
     print(f"🤖 Running {len(apps)} session(s) with DM-based control.")
     print(f"💾 Data file: {DATA_FILE}")
+    print(f"📊 Current file: {CURRENT_FILE}")
     print(f"👤 Sudo users: {SUDO_USERS}")
-    # Start all apps in parallel and keep them running
+    print(f"⏱️  Delay range: {DELAY_RANGE[0]}-{DELAY_RANGE[1]} seconds")
     await asyncio.gather(*[a.start() for a in apps])
-    # Idle forever
     await asyncio.get_event_loop().create_future()
 
 if __name__ == "__main__":
